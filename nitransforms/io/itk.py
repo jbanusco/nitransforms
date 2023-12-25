@@ -347,7 +347,11 @@ class ITKDisplacementsField(DisplacementsField):
             warnings.warn("Incorrect intent identified.")
             hdr.set_intent("vector")
 
+        # If Z is 1, don't squeeze that dimension! -- we are working in 2D with fake 3D
         field = np.squeeze(np.asanyarray(imgobj.dataobj))
+        if shape[2] == 1:
+            # Add the Z dimension back
+            field = field[:, :, np.newaxis, ...]
         field[..., (0, 1)] *= -1.0
 
         return imgobj.__class__(field, imgobj.affine, hdr)

@@ -63,9 +63,12 @@ class DenseFieldTransform(TransformBase):
 
         if field is not None:
             field = _ensure_image(field)
-            self._field = np.squeeze(
-                np.asanyarray(field.dataobj) if hasattr(field, "dataobj") else field
-            )
+            if field.ndim == 4:
+                self._field = np.asanyarray(field.dataobj) if hasattr(field, "dataobj") else field
+            else:
+                self._field = np.squeeze(
+                    np.asanyarray(field.dataobj) if hasattr(field, "dataobj") else field
+                )
         else:
             self._field = np.zeros((*reference.shape, reference.ndim), dtype="float32")
             is_deltas = True
