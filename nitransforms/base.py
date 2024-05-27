@@ -288,15 +288,27 @@ class TransformBase:
             _as_homogeneous(self.map(_ref.ndcoords.T), dim=_ref.ndim)
         )
 
-        resampled = ndi.map_coordinates(
-            data,
-            targets.T,
-            output=output_dtype,
-            order=order,
-            mode=mode,
-            cval=cval,
-            prefilter=prefilter,
-        )
+        # NOTE: Error here in the resampling when it is a 'Fake 3D' and the Z-target value is > 0. // not sure why it is not an error 'always'
+        if spatialimage.shape[-1] == 1:
+            resampled = ndi.map_coordinates(
+                data.squeeze(),
+                targets[...,:-1].T,
+                output=output_dtype,
+                order=order,
+                mode=mode,
+                cval=cval,
+                prefilter=prefilter,
+            )
+        else:
+            resampled = ndi.map_coordinates(
+                data,
+                targets.T,
+                output=output_dtype,
+                order=order,
+                mode=mode,
+                cval=cval,
+                prefilter=prefilter,
+            )
 
         if isinstance(_ref, ImageGrid):  # If reference is grid, reshape
             hdr = None
