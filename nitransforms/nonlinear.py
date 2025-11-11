@@ -7,27 +7,36 @@
 #
 ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ### ##
 """Nonlinear transforms."""
+
 import warnings
 from functools import partial
+from collections import namedtuple
 import numpy as np
+import nibabel as nb
 
 from nitransforms import io
 from nitransforms.io.base import _ensure_image
+from nitransforms.io.x5 import from_filename as load_x5
 from nitransforms.interp.bspline import grid_bspline_weights, _cubic_bspline
 from nitransforms.base import (
     TransformBase,
     TransformError,
     ImageGrid,
-    SpatialReference,
     _as_homogeneous,
 )
 from scipy.ndimage import map_coordinates
+
+# Avoids circular imports
+try:
+    from nitransforms._version import __version__
+except ModuleNotFoundError:  # pragma: no cover
+    __version__ = "0+unknown"
 
 
 class DenseFieldTransform(TransformBase):
     """Represents dense field (voxel-wise) transforms."""
 
-    __slots__ = ("_field", "_deltas")
+    __slots__ = ("_field", "_deltas", "_is_deltas")
 
     def __init__(self, field=None, is_deltas=True, reference=None):
         """
@@ -56,50 +65,61 @@ class DenseFieldTransform(TransformBase):
         <DenseFieldTransform[3D] (57, 67, 56)>
 
         """
+
         if field is None and reference is None:
-            raise TransformError("DenseFieldTransforms require a spatial reference")
+            raise TransformError("cannot initialize field")
 
         super().__init__()
 
         if field is not None:
             field = _ensure_image(field)
-            if field.ndim == 4:
-                self._field = np.asanyarray(field.dataobj) if hasattr(field, "dataobj") else field
-            else:
-                self._field = np.squeeze(
-                    np.asanyarray(field.dataobj) if hasattr(field, "dataobj") else field
-                )
-        else:
-            self._field = np.zeros((*reference.shape, reference.ndim), dtype="float32")
-            is_deltas = True
+            # Extract data if nibabel object otherwise assume numpy array
+            _data = np.squeeze(
+                np.asanyarray(field.dataobj)
+                if hasattr(field, "dataobj")
+                else field.copy()
+            )
 
         try:
-            self.reference = ImageGrid(
-                reference if reference is not None else field
-            )
+            self.reference = ImageGrid(reference if reference is not None else field)
         except AttributeError:
             raise TransformError(
-                "Field must be a spatial image if reference is not provided"
-                if reference is None else
-                "Reference is not a spatial image"
+                "field must be a spatial image if reference is not provided"
+                if reference is None
+                else "reference is not a spatial image"
             )
 
-        ndim = self._field.ndim - 1
-        if self._field.shape[-1] != ndim:
+        fieldshape = (*self.reference.shape, self.reference.ndim)
+        if field is None:
+            _data = np.zeros(fieldshape)
+        elif fieldshape != _data.shape:
             raise TransformError(
-                "The number of components of the field (%d) does not match "
-                "the number of dimensions (%d)" % (self._field.shape[-1], ndim)
+                f"Shape of the field ({'x'.join(str(i) for i in _data.shape)}) "
+                f"doesn't match that of the reference({'x'.join(str(i) for i in fieldshape)})"
             )
 
-        if is_deltas:
-            self._deltas = self._field
-            # Convert from displacements (deltas) to deformations fields
-            # (just add its origin to each delta vector)
-            self._field += self.reference.ndcoords.T.reshape(self._field.shape)
+        self._is_deltas = is_deltas
+        self._field = self.reference.ndcoords.reshape(fieldshape)
+
+        if self.is_deltas:
+            self._deltas = _data.copy()
+            self._field += self._deltas
+        else:
+            self._field = _data.copy()
 
     def __repr__(self):
         """Beautify the python representation."""
         return f"<{self.__class__.__name__}[{self._field.shape[-1]}D] {self._field.shape[:3]}>"
+
+    @property
+    def is_deltas(self):
+        """Check whether this is a displacements (``True``) or a deformation (``False``) field."""
+        return self._is_deltas
+
+    @property
+    def ndim(self):
+        """Get the dimensions of the transform."""
+        return self._field.ndim - 1
 
     def map(self, x, inverse=False):
         r"""
@@ -130,7 +150,7 @@ class DenseFieldTransform(TransformBase):
         ...     test_dir / "someones_displacement_field.nii.gz",
         ...     is_deltas=False,
         ... )
-        >>> xfm.map([-6.5, -36., -19.5]).tolist()
+        >>> xfm.map([[-6.5, -36., -19.5]]).tolist()
         [[0.0, -0.47516798973083496, 0.0]]
 
         >>> xfm.map([[-6.5, -36., -19.5], [-1., -41.5, -11.25]]).tolist()
@@ -147,8 +167,8 @@ class DenseFieldTransform(TransformBase):
         ...     test_dir / "someones_displacement_field.nii.gz",
         ...     is_deltas=True,
         ... )
-        >>> xfm.map([[-6.5, -36., -19.5], [-1., -41.5, -11.25]]).tolist()
-        [[-6.5, -36.47516632080078, -19.5], [-1.0, -42.03835678100586, -11.25]]
+        >>> xfm.map([[-6.5, -36., -19.5], [-1., -41.5, -11.25]]).tolist()  # doctest: +ELLIPSIS
+        [[-6.5, -36.475..., -19.5], [-1.0, -42.038..., -11.25]]
 
         >>> np.array_str(
         ...     xfm.map([[-6.7, -36.3, -19.2], [-1., -41.5, -11.25]]),
@@ -161,27 +181,32 @@ class DenseFieldTransform(TransformBase):
 
         if inverse is True:
             raise NotImplementedError
-        ijk = self.reference.index(x)
+
+        ijk = self.reference.index(np.array(x, dtype="float32"))
         indexes = np.round(ijk).astype("int")
+        ongrid = np.where(np.linalg.norm(ijk - indexes, axis=1) < 1e-3)[0]
 
-        if np.all(np.abs(ijk - indexes) < 1e-3):
-            indexes = tuple(tuple(i) for i in indexes.T)
-            return self._field[indexes]
+        if ongrid.size == np.shape(x)[0]:
+            # return self._field[*indexes.T, :]  # From Python 3.11
+            return self._field[tuple(indexes.T) + (np.s_[:],)]
 
-        new_map = np.vstack(tuple(
-            map_coordinates(
-                self._field[..., i],
-                ijk.T,
-                order=3,
-                mode="constant",
-                cval=np.nan,
-                prefilter=True,
-            ) for i in range(self.reference.ndim)
-        )).T
+        mapped_coords = np.vstack(
+            tuple(
+                map_coordinates(
+                    self._field[..., i],
+                    ijk.T,
+                    order=3,
+                    mode="constant",
+                    cval=np.nan,
+                    prefilter=True,
+                )
+                for i in range(self.reference.ndim)
+            )
+        ).T
 
-        # Set NaN values back to the original coordinates value -- no transformation/displacement
-        new_map[np.isnan(new_map)] = x[np.isnan(new_map)]
-        return new_map
+        # Set NaN values back to the original coordinates value = no displacement
+        mapped_coords[np.isnan(mapped_coords)] = np.array(x)[np.isnan(mapped_coords)]
+        return mapped_coords
 
     def __matmul__(self, b):
         """
@@ -203,9 +228,9 @@ class DenseFieldTransform(TransformBase):
         True
 
         """
-        retval = b.map(
-            self._field.reshape((-1, self._field.shape[-1]))
-        ).reshape(self._field.shape)
+        retval = b.map(self._field.reshape((-1, self._field.shape[-1]))).reshape(
+            self._field.shape
+        )
         return DenseFieldTransform(retval, is_deltas=False, reference=self.reference)
 
     def __eq__(self, other):
@@ -218,24 +243,89 @@ class DenseFieldTransform(TransformBase):
         >>> xfm2 = DenseFieldTransform(test_dir / "someones_displacement_field.nii.gz")
         >>> xfm1 == xfm2
         True
+        >>> xfm1 == TransformBase()
+        False
+        >>> xfm1 == BSplineFieldTransform(test_dir / "someones_bspline_coefficients.nii.gz")
+        False
 
         """
-        _eq = np.array_equal(self._field, other._field)
+        if not hasattr(other, "_field") or self._field.shape != other._field.shape:
+            return False
+
+        _eq = np.allclose(self._field, other._field)
         if _eq and self._reference != other._reference:
             warnings.warn("Fields are equal, but references do not match.")
         return _eq
 
+    def to_filename(self, filename, fmt="X5", moving=None, x5_inverse=False):
+        """Store the transform in the designated format."""
+
+        if fmt.upper() == "X5":
+            raise TypeError("Please use .to_x5()")
+
+        field = nb.Nifti1Image(
+            self._deltas if self.is_deltas else self._field,
+            self.reference.affine,
+            None,
+        )
+
+        if fmt.lower() == "afni":
+            from nitransforms.io.afni import AFNIDisplacementsField as FieldIOType
+
+        elif fmt.lower() in ("itk", "ants", "elastix"):
+            from nitransforms.io.itk import ITKDisplacementsField as FieldIOType
+
+        elif fmt.lower() == "fsl":
+            from nitransforms.io.fsl import FSLDisplacementsField as FieldIOType
+
+        else:
+            raise NotImplementedError(
+                f"Dense field of type '{fmt}' cannot be converted."
+            )
+
+        FieldIOType.to_image(field).to_filename(filename)
+
+    def to_x5(self, metadata=None):
+        """Return an :class:`~nitransforms.io.x5.X5Transform` representation."""
+        metadata = {"WrittenBy": f"NiTransforms {__version__}"} | (metadata or {})
+
+        domain = None
+        if (reference := self.reference) is not None:
+            domain = io.x5.X5Domain(
+                grid=True,
+                size=getattr(reference, "shape", (0, 0, 0)),
+                mapping=reference.affine,
+                coordinates="cartesian",
+            )
+
+        kinds = tuple("space" for _ in range(self.ndim)) + ("vector",)
+
+        return io.x5.X5Transform(
+            type="nonlinear",
+            subtype="densefield",
+            representation="displacements" if self.is_deltas else "deformations",
+            metadata=metadata,
+            transform=self._deltas if self.is_deltas else self._field,
+            dimension_kinds=kinds,
+            domain=domain,
+        )
+
     @classmethod
-    def from_filename(cls, filename, fmt="X5"):
+    def from_filename(cls, filename, fmt="X5", x5_position=0):
         _factory = {
             "afni": io.afni.AFNIDisplacementsField,
             "itk": io.itk.ITKDisplacementsField,
             "fsl": io.fsl.FSLDisplacementsField,
+            "X5": None,
         }
-        if fmt not in _factory:
+        fmt = fmt.upper()
+        if fmt not in {k.upper() for k in _factory}:
             raise NotImplementedError(f"Unsupported format <{fmt}>")
 
-        return cls(_factory[fmt].from_filename(filename))
+        if fmt == "X5":
+            return from_x5(load_x5(filename), x5_position=x5_position)
+
+        return cls(_factory[fmt.lower()].from_filename(filename))
 
 
 load = DenseFieldTransform.from_filename
@@ -244,7 +334,7 @@ load = DenseFieldTransform.from_filename
 class BSplineFieldTransform(TransformBase):
     """Represent a nonlinear transform parameterized by BSpline basis."""
 
-    __slots__ = ['_coeffs', '_knots', '_weights', '_order', '_moving']
+    __slots__ = ["_coeffs", "_knots", "_weights", "_order", "_moving"]
 
     def __init__(self, coefficients, reference=None, order=3):
         """Create a smooth deformation field using B-Spline basis."""
@@ -259,28 +349,78 @@ class BSplineFieldTransform(TransformBase):
         if reference is not None:
             self.reference = reference
 
-            if coefficients.shape[-1] != self.ndim:
+            if coefficients.shape[-1] != self.reference.ndim:
                 raise TransformError(
-                    'Number of components of the coefficients does '
-                    'not match the number of dimensions')
+                    "Number of components of the coefficients does "
+                    "not match the number of dimensions"
+                )
+
+    def __eq__(self, other):
+        """
+        Overload equals operator.
+
+        Examples
+        --------
+        >>> xfm1 = BSplineFieldTransform(test_dir / "someones_bspline_coefficients.nii.gz")
+        >>> xfm2 = BSplineFieldTransform(test_dir / "someones_bspline_coefficients.nii.gz")
+        >>> xfm1 == xfm2
+        True
+        >>> xfm2._coeffs[:, :, :] = 0  # Let's zero all coefficients
+        >>> xfm1 == xfm2
+        False
+        >>> xfm2 = BSplineFieldTransform(
+        ...     test_dir / "someones_bspline_coefficients.nii.gz",
+        ...     order=4,
+        ... )
+        >>> xfm1 == xfm2
+        False
+        >>> xfm1 == TransformBase()
+        False
+        >>> xfm1 == DenseFieldTransform(test_dir / "someones_displacement_field.nii.gz")
+        False
+
+        """
+        if not hasattr(other, "_coeffs") or self._coeffs.shape != other._coeffs.shape:
+            return False
+
+        _eq = self._order == other._order
+        _eq = _eq and np.allclose(self._coeffs, other._coeffs)
+
+        if _eq and self._reference != other._reference:
+            warnings.warn("Coefficients are equal, but references do not match.")
+        return _eq
+
+    @property
+    def ndim(self):
+        """Get the dimensions of the transform."""
+        return self._coeffs.ndim - 1
+
+    @classmethod
+    def from_filename(cls, filename, fmt="X5", x5_position=0):
+        _factory = {
+            "X5": None,
+        }
+        fmt = fmt.upper()
+        if fmt not in {k.upper() for k in _factory}:
+            raise NotImplementedError(f"Unsupported format <{fmt}>")
+
+        return from_x5(load_x5(filename), x5_position=x5_position)
+        # return cls(_factory[fmt.lower()].from_filename(filename))
 
     def to_field(self, reference=None, dtype="float32"):
         """Generate a displacements deformation field from this B-Spline field."""
         _ref = (
-            self.reference if reference is None else
-            ImageGrid(_ensure_image(reference))
+            self.reference if reference is None else ImageGrid(_ensure_image(reference))
         )
         if _ref is None:
             raise TransformError("A reference must be defined")
 
-        ndim = self._coeffs.shape[-1]
-
         if self._weights is None:
             self._weights = grid_bspline_weights(_ref, self._knots)
 
-        field = np.zeros((_ref.npoints, ndim))
+        field = np.zeros((_ref.npoints, self.ndim))
 
-        for d in range(ndim):
+        for d in range(self.ndim):
             #  1 x Nvox :                          (1 x K) @ (K x Nvox)
             field[:, d] = self._coeffs[..., d].reshape(-1) @ self._weights
 
@@ -288,45 +428,30 @@ class BSplineFieldTransform(TransformBase):
             field.astype(dtype).reshape(*_ref.shape, -1), reference=_ref
         )
 
-    def apply(
-        self,
-        spatialimage,
-        reference=None,
-        order=3,
-        mode="constant",
-        cval=0.0,
-        prefilter=True,
-        output_dtype=None,
-    ):
-        """Apply a B-Spline transform on input data."""
+    def to_x5(self, metadata=None):
+        """Return an :class:`~nitransforms.io.x5.X5Transform` representation."""
+        metadata = {"WrittenBy": f"NiTransforms {__version__}"} | (metadata or {})
 
-        _ref = (
-            self.reference if reference is None else
-            SpatialReference.factory(_ensure_image(reference))
-        )
-        spatialimage = _ensure_image(spatialimage)
-
-        # If locations to be interpolated are not on a grid, run map()
-        if not isinstance(_ref, ImageGrid):
-            return super().apply(
-                spatialimage,
-                reference=_ref,
-                order=order,
-                mode=mode,
-                cval=cval,
-                prefilter=prefilter,
-                output_dtype=output_dtype,
+        domain = None
+        if (reference := self.reference) is not None:
+            domain = io.x5.X5Domain(
+                grid=True,
+                size=getattr(reference, "shape", (0, 0, 0)),
+                mapping=reference.affine,
+                coordinates="cartesian",
             )
 
-        # If locations to be interpolated are on a grid, generate a displacements field
-        return self.to_field(reference=reference).apply(
-            spatialimage,
-            reference=reference,
-            order=order,
-            mode=mode,
-            cval=cval,
-            prefilter=prefilter,
-            output_dtype=output_dtype,
+        kinds = tuple("space" for _ in range(self.ndim)) + ("vector",)
+
+        return io.x5.X5Transform(
+            type="nonlinear",
+            subtype="bspline",
+            representation="coefficients",
+            metadata=metadata,
+            transform=self._coeffs,
+            dimension_kinds=kinds,
+            domain=domain,
+            additional_parameters=self._knots.affine,
         )
 
     def map(self, x, inverse=False):
@@ -353,11 +478,11 @@ class BSplineFieldTransform(TransformBase):
         --------
         >>> xfm = BSplineFieldTransform(test_dir / "someones_bspline_coefficients.nii.gz")
         >>> xfm.reference = test_dir / "someones_anatomy.nii.gz"
-        >>> xfm.map([-6.5, -36., -19.5]).tolist()
-        [[-6.5, -31.476097418406784, -19.5]]
+        >>> xfm.map([-6.5, -36., -19.5]).tolist()  # doctest: +ELLIPSIS
+        [[-6.5, -36.475114..., -19.5]]
 
-        >>> xfm.map([[-6.5, -36., -19.5], [-1., -41.5, -11.25]]).tolist()
-        [[-6.5, -31.476097418406784, -19.5], [-1.0, -3.8072675377121996, -11.25]]
+        >>> xfm.map([[-6.5, -36., -19.5], [-1., -41.5, -11.25]]).tolist()  # doctest: +ELLIPSIS
+        [[-6.5, -36.475114..., -19.5], [-1.0, -42.03878957..., -11.25]]
 
         """
         vfunc = partial(
@@ -369,24 +494,54 @@ class BSplineFieldTransform(TransformBase):
         return np.array([vfunc(_x).tolist() for _x in np.atleast_2d(x)])
 
 
+def from_x5(x5_list, x5_position=0):
+    """Create a transform from a list of :class:`~nitransforms.io.x5.X5Transform` objects."""
+
+    x5_xfm = x5_list[x5_position]
+
+    Transform = (
+        BSplineFieldTransform if x5_xfm.subtype == "bspline" else DenseFieldTransform
+    )
+    Domain = namedtuple("Domain", "affine shape")
+    reference = Domain(x5_xfm.domain.mapping, x5_xfm.domain.size)
+    xfm_params = (
+        nb.Nifti1Image(x5_xfm.transform, x5_xfm.additional_parameters)
+        if x5_xfm.subtype == "bspline"
+        else x5_xfm.transform
+    )
+
+    xfm_kwargs = (
+        {}
+        if x5_xfm.subtype == "bspline"
+        else {"is_deltas": x5_xfm.representation == "displacements"}
+    )
+
+    return Transform(xfm_params, reference=reference, **xfm_kwargs)
+
+
 def _map_xyz(x, reference, knots, coeffs):
     """Apply the transformation to just one coordinate."""
     ndim = len(x)
     # Calculate the index coordinates of the point in the B-Spline grid
     ijk = (knots.inverse @ _as_homogeneous(x).squeeze())[:ndim]
 
-    # Determine the window within distance 2.0 (where the B-Spline is nonzero)
+    # Determine the window within distance 2.0 (where the B-Spline is nonzero).
     # Probably this will change if the order of the B-Spline is different
     w_start, w_end = np.ceil(ijk - 2).astype(int), np.floor(ijk + 2).astype(int)
-    # Generate a grid of indexes corresponding to the window
-    nonzero_knots = tuple([
-        np.arange(start, end + 1) for start, end in zip(w_start, w_end)
-    ])
+
+    # Generate a grid of indexes corresponding to the window, clipped to the
+    # coefficient grid boundaries
+    nonzero_knots = []
+    for start, end, size in zip(w_start, w_end, knots.shape):
+        start = max(start, 0)
+        end = min(end, size - 1)
+        nonzero_knots.append(np.arange(start, end + 1))
     nonzero_knots = tuple(np.meshgrid(*nonzero_knots, indexing="ij"))
     window = np.array(nonzero_knots).reshape((ndim, -1))
 
-    # Calculate the distance of the location w.r.t. to all voxels in window
-    distance = window.T - ijk
+    # Calculate the absolute distance of the location w.r.t. all voxels in
+    # the window. Distances are expressed in knot-grid voxel units
+    distance = np.abs(window.T - ijk)
     # Since this is a grid, distance only takes a few float values
     unique_d, indices = np.unique(distance.reshape(-1), return_inverse=True)
     # Calculate the B-Spline weight corresponding to the distance.

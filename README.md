@@ -1,7 +1,7 @@
 # NiTransforms
 [![DOI](https://joss.theoj.org/papers/10.21105/joss.03459/status.svg)](https://doi.org/10.21105/joss.03459)
 [![ISBI2020](https://img.shields.io/badge/doi-10.31219%2Fosf.io%2F8aq7b-blue.svg)](https://doi.org/10.31219/osf.io/8aq7b)
-[![Deps & CI](https://github.com/nipy/nitransforms/actions/workflows/travis.yml/badge.svg)](https://github.com/nipy/nitransforms/actions/workflows/travis.yml)
+[![Deps & CI](https://github.com/nipy/nitransforms/actions/workflows/tox.yml/badge.svg)](https://github.com/nipy/nitransforms/actions/workflows/tox.yml)
 [![CircleCI](https://circleci.com/gh/nipy/nitransforms.svg?style=svg)](https://circleci.com/gh/nipy/nitransforms)
 [![codecov](https://codecov.io/gh/nipy/nitransforms/branch/master/graph/badge.svg)](https://codecov.io/gh/nipy/nitransforms)
 [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/nipy/nitransforms/master?filepath=docs%2Fnotebooks%2F)
@@ -28,6 +28,11 @@ compatibility with each supported tool after every change to the code base.
 Compatibility between software tools and imaging formats is a necessary bridge
 to ensure the reproducibility of results and enable the optimization and evaluation
 of current image processing and analysis workflows.
+
+## BIDS' X5 format
+As of [the 25.0.0 release](https://github.com/nipy/nitransforms/releases/tag/25.0.0),
+*NiTransforms* experimentally supports writing X5 transform files, as drafted in the
+BIDS Extension Proposal 14 (BEP014).
 
 ## Integration with *NiBabel*
 *NiTransforms* started as a feature-repo spun off of *NiBabel*.

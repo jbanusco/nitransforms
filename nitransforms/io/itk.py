@@ -1,4 +1,5 @@
 """Read/write ITK transforms."""
+
 import warnings
 import numpy as np
 from scipy.io import loadmat as _read_mat, savemat as _save_mat
@@ -138,8 +139,7 @@ class ITKLinearTransform(LinearParameters):
         sa = tf.structarr
 
         affine = mdict.get(
-            "AffineTransform_double_3_3",
-            mdict.get("AffineTransform_float_3_3")
+            "AffineTransform_double_3_3", mdict.get("AffineTransform_float_3_3")
         )
 
         if affine is None:
@@ -337,7 +337,7 @@ class ITKDisplacementsField(DisplacementsField):
         hdr = imgobj.header.copy()
         shape = hdr.get_data_shape()
 
-        if len(shape) != 5 or shape[-2] != 1 or not shape[-1] in (2, 3):
+        if len(shape) != 5 or shape[-2] != 1 or shape[-1] not in (2, 3):
             raise TransformFileError(
                 'Displacements field "%s" does not come from ITK.'
                 % imgobj.file_map["image"].filename
@@ -355,6 +355,18 @@ class ITKDisplacementsField(DisplacementsField):
         field[..., (0, 1)] *= -1.0
 
         return imgobj.__class__(field, imgobj.affine, hdr)
+
+    @classmethod
+    def to_image(cls, imgobj):
+        """Export a displacements field from a nibabel object."""
+
+        hdr = imgobj.header.copy()
+        hdr.set_intent("vector")
+
+        warp_data = imgobj.get_fdata().reshape(imgobj.shape[:3] + (1, imgobj.shape[-1]))
+        warp_data[..., (0, 1)] *= -1
+
+        return imgobj.__class__(warp_data, imgobj.affine, hdr)
 
 
 class ITKCompositeH5:
@@ -395,23 +407,28 @@ class ITKCompositeH5:
             if xfm["TransformType"][0].startswith(b"DisplacementFieldTransform"):
                 if only_linear:
                     continue
-                _fixed = np.asanyarray(xfm[f"{typo_fallback}FixedParameters"])
-                shape = _fixed[:3].astype("uint16").tolist()
-                offset = _fixed[3:6].astype("float")
-                zooms = _fixed[6:9].astype("float")
-                directions = _fixed[9:].astype("float").reshape((3, 3))
+                _fixed = xfm[f"{typo_fallback}FixedParameters"]
+                shape = _fixed[:3]
+                offset = _fixed[3:6]
+                zooms = _fixed[6:9]
+                directions = np.reshape(_fixed[9:], (3, 3))
                 affine = from_matvec(directions * zooms, offset)
-                field = np.asanyarray(xfm[f"{typo_fallback}Parameters"]).reshape(
-                    (*shape, 1, -1)
+                # ITK uses Fortran ordering, like NIfTI, but with the vector dimension first
+                field = np.moveaxis(
+                    np.reshape(
+                        xfm[f"{typo_fallback}Parameters"],
+                        (3, *shape.astype(int)),
+                        order="F",
+                    ),
+                    0,
+                    -1,
                 )
                 field[..., (0, 1)] *= -1.0
                 hdr = Nifti1Header()
                 hdr.set_intent("vector")
                 hdr.set_data_dtype("float")
 
-                xfm_list.append(
-                    Nifti1Image(field.astype("float"), LPS @ affine @ LPS, hdr)
-                )
+                xfm_list.append(Nifti1Image(field.astype("float"), LPS @ affine, hdr))
                 continue
 
             raise TransformIOError(

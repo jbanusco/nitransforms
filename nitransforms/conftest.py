@@ -1,4 +1,5 @@
 """py.test configuration."""
+
 import os
 from pathlib import Path
 import numpy as np
@@ -6,8 +7,6 @@ import nibabel as nb
 import pytest
 import tempfile
 
-_data = None
-_brainmask = None
 _testdir = Path(os.getenv("TEST_DATA_HOME", "~/.nitransforms/testdata")).expanduser()
 _datadir = Path(__file__).parent / "tests" / "data"
 
@@ -48,10 +47,6 @@ def testdata_path():
 @pytest.fixture
 def get_testdata():
     """Generate data in the requested orientation."""
-    global _data
-
-    if _data is not None:
-        return _data
 
     return _reorient(_testdir / "someones_anatomy.nii.gz")
 
@@ -59,11 +54,6 @@ def get_testdata():
 @pytest.fixture
 def get_testmask():
     """Generate data in the requested orientation."""
-    global _brainmask
-
-    if _brainmask is not None:
-        return _brainmask
-
     return _reorient(_testdir / "someones_anatomy_brainmask.nii.gz")
 
 
@@ -75,7 +65,9 @@ def _reorient(path):
     newaff = imgaff.copy()
     newaff[0, 0] *= -1.0
     newaff[0, 3] = imgaff.dot(np.hstack((np.array(img.shape[:3]) - 1, 1.0)))[0]
-    _data["LAS"] = nb.Nifti1Image(np.flip(np.asanyarray(img.dataobj), 0), newaff, img.header)
+    _data["LAS"] = nb.Nifti1Image(
+        np.flip(np.asanyarray(img.dataobj), 0), newaff, img.header
+    )
     _data["LAS"].set_data_dtype(img.get_data_dtype())
     newaff = imgaff.copy()
     newaff[0, 0] *= -1.0

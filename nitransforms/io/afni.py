@@ -1,4 +1,5 @@
 """Read/write AFNI's transforms."""
+
 from math import pi
 import numpy as np
 from nibabel.affines import (
@@ -130,8 +131,17 @@ class AFNILinearTransformArray(BaseLinearTransformList):
 
     def to_ras(self, moving=None, reference=None):
         """Return a nitransforms' internal RAS matrix."""
+
+        pre_rotation = post_rotation = np.eye(4)
+        if reference is not None and _is_oblique(
+            ref_aff := _ensure_image(reference).affine
+        ):
+            pre_rotation = _cardinal_rotation(ref_aff, True)
+        if moving is not None and _is_oblique(mov_aff := _ensure_image(moving).affine):
+            post_rotation = _cardinal_rotation(mov_aff, False)
+
         return np.stack(
-            [xfm.to_ras(moving=moving, reference=reference) for xfm in self.xforms]
+            [post_rotation @ (xfm.to_ras() @ pre_rotation) for xfm in self.xforms]
         )
 
     def to_string(self):
@@ -144,14 +154,24 @@ class AFNILinearTransformArray(BaseLinearTransformList):
                 if line.strip()
             ]
             strings += lines
-        return "\n".join(strings)
+        return "\n".join(strings + [""])
 
     @classmethod
     def from_ras(cls, ras, moving=None, reference=None):
         """Create an ITK affine from a nitransform's RAS+ matrix."""
         _self = cls()
+
+        pre_rotation = post_rotation = np.eye(4)
+
+        if reference is not None and _is_oblique(
+            ref_aff := _ensure_image(reference).affine
+        ):
+            pre_rotation = _cardinal_rotation(ref_aff, False)
+        if moving is not None and _is_oblique(mov_aff := _ensure_image(moving).affine):
+            post_rotation = _cardinal_rotation(mov_aff, True)
+
         _self.xforms = [
-            cls._inner_type.from_ras(ras[i, ...], moving=moving, reference=reference)
+            cls._inner_type.from_ras(post_rotation @ ras[i, ...] @ pre_rotation)
             for i in range(ras.shape[0])
         ]
         return _self
@@ -182,7 +202,7 @@ class AFNIDisplacementsField(DisplacementsField):
         hdr = imgobj.header.copy()
         shape = hdr.get_data_shape()
 
-        if len(shape) != 5 or shape[-2] != 1 or not shape[-1] in (2, 3):
+        if len(shape) != 5 or shape[-2] != 1 or shape[-1] not in (2, 3):
             raise TransformFileError(
                 'Displacements field "%s" does not come from AFNI.'
                 % imgobj.file_map["image"].filename
@@ -192,6 +212,17 @@ class AFNIDisplacementsField(DisplacementsField):
         field[..., (0, 1)] *= -1.0
 
         return imgobj.__class__(field, imgobj.affine, hdr)
+
+    @classmethod
+    def to_image(cls, imgobj):
+        """Export a displacements field from a nibabel object."""
+
+        hdr = imgobj.header.copy()
+
+        warp_data = imgobj.get_fdata().reshape(imgobj.shape[:3] + (1, imgobj.shape[-1]))
+        warp_data[..., (0, 1)] *= -1
+
+        return imgobj.__class__(warp_data, imgobj.affine, hdr)
 
 
 def _is_oblique(affine, thres=OBLIQUITY_THRESHOLD_DEG):
@@ -210,7 +241,7 @@ def _is_oblique(affine, thres=OBLIQUITY_THRESHOLD_DEG):
     True
 
     """
-    return (obliquity(affine).min() * 180 / pi) > thres
+    return float(obliquity(affine).max() * 180 / pi) > thres
 
 
 def _afni_deobliqued_grid(oblique, shape):

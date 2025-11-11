@@ -1,4 +1,5 @@
 """Read/write linear transforms."""
+
 from pathlib import Path
 import numpy as np
 from nibabel import load as loadimg
@@ -76,12 +77,12 @@ class LinearParameters(LinearTransformStruct):
     Examples
     --------
     >>> lp = LinearParameters()
-    >>> np.all(lp.structarr['parameters'] == np.eye(4))
+    >>> np.array_equal(lp.structarr['parameters'], np.eye(4))
     True
 
     >>> p = np.diag([2., 2., 2., 1.])
     >>> lp = LinearParameters(p)
-    >>> np.all(lp.structarr['parameters'] == p)
+    >>> np.array_equal(lp.structarr['parameters'], p)
     True
 
     """
@@ -144,6 +145,17 @@ class DisplacementsField:
     @classmethod
     def from_image(cls, imgobj):
         """Import a displacements field from a nibabel image object."""
+        raise NotImplementedError
+
+    @classmethod
+    def to_filename(cls, img, filename):
+        """Export a displacements field to a NIfTI file."""
+        imgobj = cls.to_image(img)
+        imgobj.to_filename(filename)
+
+    @classmethod
+    def to_image(cls, imgobj):
+        """Export a displacements field image from a nitransforms image object."""
         raise NotImplementedError
 
 

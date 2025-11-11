@@ -1,64 +1,19 @@
 # emacs: -*- mode: python; py-indent-offset: 4; indent-tabs-mode: nil -*-
 # vi: set ft=python sts=4 ts=4 sw=4 et:
 """Tests of nonlinear transforms."""
-import os
-import shutil
-from subprocess import check_call
+
 import pytest
 
 import numpy as np
 import nibabel as nb
-from ..manip import load as _load, TransformChain
+import h5py
+from ..base import TransformError
+from ..manip import TransformChain
 from ..linear import Affine
-from .test_nonlinear import (
-    RMSE_TOL,
-    APPLY_NONLINEAR_CMD,
-)
+from ..nonlinear import DenseFieldTransform
+from ..io import x5
 
 FMT = {"lta": "fs", "tfm": "itk"}
-
-
-def test_itk_h5(tmp_path, testdata_path):
-    """Check a translation-only field on one or more axes, different image orientations."""
-    os.chdir(str(tmp_path))
-    img_fname = testdata_path / "T1w_scanner.nii.gz"
-    xfm_fname = (
-        testdata_path
-        / "ds-005_sub-01_from-T1w_to-MNI152NLin2009cAsym_mode-image_xfm.h5"
-    )
-
-    xfm = _load(xfm_fname)
-
-    assert len(xfm) == 2
-
-    ref_fname = tmp_path / "reference.nii.gz"
-    nb.Nifti1Image(
-        np.zeros(xfm.reference.shape, dtype="uint16"), xfm.reference.affine,
-    ).to_filename(str(ref_fname))
-
-    # Then apply the transform and cross-check with software
-    cmd = APPLY_NONLINEAR_CMD["itk"](
-        transform=xfm_fname,
-        reference=ref_fname,
-        moving=img_fname,
-        output="resampled.nii.gz",
-        extra="",
-    )
-
-    # skip test if command is not available on host
-    exe = cmd.split(" ", 1)[0]
-    if not shutil.which(exe):
-        pytest.skip(f"Command {exe} not found on host")
-
-    exit_code = check_call([cmd], shell=True)
-    assert exit_code == 0
-    sw_moved = nb.load("resampled.nii.gz")
-
-    nt_moved = xfm.apply(img_fname, order=0)
-    nt_moved.to_filename("nt_resampled.nii.gz")
-    diff = sw_moved.get_fdata() - nt_moved.get_fdata()
-    # A certain tolerance is necessary because of resampling at borders
-    assert (np.abs(diff) > 1e-3).sum() / diff.size < RMSE_TOL
 
 
 @pytest.mark.parametrize("ext0", ["lta", "tfm"])
@@ -87,3 +42,47 @@ def test_collapse_affines(tmp_path, data_path, ext0, ext1, ext2):
             fmt=f"{FMT[ext2]}",
         ).matrix,
     )
+
+
+def test_transformchain_x5_roundtrip(tmp_path):
+    """Round-trip TransformChain with X5 storage."""
+
+    # Test empty transform file
+    x5.to_filename(tmp_path / "empty.x5", [])
+    with pytest.raises(TransformError):
+        TransformChain.from_filename(tmp_path / "empty.x5")
+
+    mat = np.eye(4)
+    mat[0, 3] = 1
+    aff = Affine(mat)
+
+    # Test loading X5 with no transforms chains
+    x5.to_filename(tmp_path / "nochain.x5", [aff.to_x5()])
+    with pytest.raises(TransformError):
+        TransformChain.from_filename(tmp_path / "nochain.x5")
+
+    field = nb.Nifti1Image(np.zeros((5, 5, 5, 3), dtype="float32"), np.eye(4))
+    fdata = field.get_fdata()
+    fdata[..., 1] = 1
+    field = nb.Nifti1Image(fdata, np.eye(4))
+    dfield = DenseFieldTransform(field, is_deltas=True)
+
+    # Create a chain
+    chain = TransformChain([aff, aff, aff, dfield])
+    fname = tmp_path / "chain.x5"
+    chain.to_filename(fname)
+
+    with h5py.File(fname) as f:
+        assert len(f["TransformGroup"]) == 2
+
+    chain.to_filename(fname)  # append again, should not duplicate transforms
+
+    with h5py.File(fname) as f:
+        assert len(f["TransformGroup"]) == 2
+
+    loaded0 = TransformChain.from_filename(fname, fmt="X5", x5_chain=0)
+    loaded1 = TransformChain.from_filename(fname, fmt="X5", x5_chain=1)
+
+    assert len(loaded0) == len(chain)
+    assert len(loaded1) == len(chain)
+    assert np.allclose(chain.map([[0, 0, 0]]), loaded1.map([[0, 0, 0]]))
