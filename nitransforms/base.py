@@ -97,7 +97,8 @@ class ImageGrid(SampledSpatialData):
     def __init__(self, image):
         """Create a gridded sampling reference."""
         if isinstance(image, (str, Path)):
-            image = _nbfuncs.squeeze_image(_nbload(str(image)))
+            # image = _nbfuncs.squeeze_image(_nbload(str(image)))
+            image = _nbload(str(image))
 
         self._affine = image.affine
         self._shape = image.shape
