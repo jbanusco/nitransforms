@@ -22,7 +22,7 @@ def genericlabel_interpolator(labelImage: nib.Nifti1Image,
     )
     reference = xfm.reference
     targets = ImageGrid(labelImage).index(  # data should be an image
-        _as_homogeneous(xfm.map(reference.ndcoords.T), dim=reference.ndim)
+        _as_homogeneous(xfm.map(reference.ndcoords), dim=reference.ndim)
     )
     
     best_values = np.zeros_like(data)

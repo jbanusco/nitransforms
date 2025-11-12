@@ -74,12 +74,14 @@ class DenseFieldTransform(TransformBase):
         if field is not None:
             field = _ensure_image(field)
             # Extract data if nibabel object otherwise assume numpy array
-            _data = np.squeeze(
-                np.asanyarray(field.dataobj)
-                if hasattr(field, "dataobj")
-                else field.copy()
-            )
-
+            if field.ndim == 4:
+                _data = np.asanyarray(field.dataobj) if hasattr(field, "dataobj") else field.copy()
+            else:
+                _data = np.squeeze(
+                    np.asanyarray(field.dataobj) 
+                    if hasattr(field, "dataobj") 
+                    else field.copy()
+                )
         try:
             self.reference = ImageGrid(reference if reference is not None else field)
         except AttributeError:
